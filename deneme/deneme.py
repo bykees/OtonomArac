@@ -1,135 +1,153 @@
 import cv2
 import numpy as np
 
-# Kamerayı başlatıyoruz
+# --- GLOBAL DEĞİŞKENLER (Robotun Hafızası) ---
+kirmizi_sayaci = 0 
+
+# --- ALGI KATMANI (Perception Layer) ---
+
+def kirmizi_isik_analiz(frame, hsv_frame):
+    """Kırmızı ışığı; renk, konum, yuvarlaklık, oran ve boyut testlerinden geçirir."""
+    global kirmizi_sayaci
+    
+    # 1. Renk Süzgeci
+    m1 = cv2.inRange(hsv_frame, np.array([0, 120, 70]), np.array([10, 255, 255]))
+    m2 = cv2.inRange(hsv_frame, np.array([160, 120, 70]), np.array([179, 255, 255]))
+    maske = m1 + m2
+    
+    konturlar, _ = cv2.findContours(maske, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    isik_tespit_edildi = False
+    
+    for c in konturlar:
+        alan = cv2.contourArea(c)
+        cevre = cv2.arcLength(c, True)
+        
+        # A. Boyut Filtresi (Çok küçük gürültüleri ve aşırı büyük hataları eler)
+        if 1000 < alan < (frame.shape[0] * frame.shape[1] // 4):
+            if cevre > 0:
+                # B. Yuvarlaklık Testi (Circularity)
+                yuvarlaklik = (4 * np.pi * alan) / (cevre * cevre)
+                
+                if yuvarlaklik > 0.7:
+                    xk, yk, wk, hk = cv2.boundingRect(c)
+                    
+                    # C. Oran Kontrolü (Aspect Ratio - Kareye yakın olmalı)
+                    oran = float(wk) / hk
+                    if 0.7 < oran < 1.3:
+                        
+                        # D. Konum Kontrolü (Ekranın üst kısmında mı?)
+                        if yk < frame.shape[0] * 0.6:
+                            
+                            # E. Merkez Doluluk Testi (Hız tabelasından ayırmak için)
+                            mx, my = xk + wk//2, yk + hk//2
+                            merkez_bolge = maske[max(0, my-5):min(frame.shape[0], my+5), 
+                                                 max(0, mx-5):min(frame.shape[1], mx+5)]
+                            
+                            if cv2.countNonZero(merkez_bolge) > 15:
+                                isik_tespit_edildi = True
+                                # Tespit edilen ışığı kare içine alalım
+                                cv2.rectangle(frame, (xk, yk), (xk+wk, yk+hk), (0, 0, 255), 2)
+                                break 
+
+    # F. Güven Filtresi (Temporal Filtering - Arka arkaya 3 kare görme şartı)
+    if isik_tespit_edildi:
+        kirmizi_sayaci += 1
+    else:
+        kirmizi_sayaci = 0 
+    
+    return kirmizi_sayaci >= 3
+
+def tabela_analiz(frame, hsv_frame):
+    """Mavi tabelayı ve içindeki okun yönünü analiz eder."""
+    alt_mavi = np.array([100, 150, 50])
+    ust_mavi = np.array([140, 255, 255])
+    maske = cv2.inRange(hsv_frame, alt_mavi, ust_mavi)
+    
+    konturlar, _ = cv2.findContours(maske, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in konturlar:
+        alan = cv2.contourArea(c)
+        if alan > 2500:
+            cevre = cv2.arcLength(c, True)
+            circ = (4 * np.pi * alan) / (cevre * cevre)
+            if circ > 0.65: # Sadece dairesel nesneler
+                tx, ty, tw, th = cv2.boundingRect(c)
+                t_ici = maske[ty:ty+th, tx:tx+tw]
+                sol = cv2.countNonZero(t_ici[:, 0:tw//2])
+                sag = cv2.countNonZero(t_ici[:, tw//2:tw])
+                cv2.rectangle(frame, (tx, ty), (tx+tw, ty+th), (255, 255, 0), 2)
+                return "SOLA_DON" if sol > sag + 150 else "SAGA_DON"
+    return "YOK"
+
+def serit_takip_analiz(hsv_frame):
+    """Yoldaki şeritleri bulur ve sapma (hata) miktarını hesaplar."""
+    H, W = hsv_frame.shape[:2]
+    roi = hsv_frame[int(H*0.75):H, 0:W]
+    maske = cv2.inRange(roi, np.array([0,0,0]), np.array([180,255,40]))
+    
+    def merkez_bul(taraf):
+        k, _ = cv2.findContours(taraf, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if k:
+            b = max(k, key=cv2.contourArea)
+            if cv2.contourArea(b) > 500:
+                M = cv2.moments(b)
+                if M["m00"] > 0: return int(M["m10"]/M["m00"])
+        return -1
+
+    lcx = merkez_bul(maske[:, 0:W//2])
+    rcx_ham = merkez_bul(maske[:, W//2:W])
+    rcx = rcx_ham + W//2 if rcx_ham != -1 else W
+    
+    yol_o = (lcx + rcx) // 2 if (lcx != -1 and rcx != W) else W//2
+    return yol_o - (W // 2), lcx, rcx, yol_o
+
+# --- KARAR KATMANI (Decision Layer) ---
+
+def karar_verici(isik_var, tabela_yon, serit_hatasi):
+    """Tüm algılardan gelen verileri birleştirip tek bir emir üretir (Hiyerarşik)."""
+    # 1. Öncelik: Güvenlik (Kırmızı Işık)
+    if isik_var:
+        return "DUR"
+    
+    # 2. Öncelik: Tabelalar (Manüel Yönlendirme)
+    if tabela_yon != "YOK":
+        return tabela_yon
+    
+    # 3. Öncelik: Otonom Şerit Takibi
+    if serit_hatasi < -30: return "SOLA_KIR"
+    if serit_hatasi > 30: return "SAGA_KIR"
+    
+    return "DUZ_GIT"
+
+# --- UYGULAMA KATMANI (Main Loop) ---
+
 kamera = cv2.VideoCapture(0)
 
 while True:
     ret, kare = kamera.read()
     if not ret: break
-    
-    # Test kolaylığı için görüntüyü aynalıyoruz
-    kare = cv2.flip(kare, 1)
+    kare = cv2.flip(kare, 1) # Bilgisayar testi için ayna modu
     hsv = cv2.cvtColor(kare, cv2.COLOR_BGR2HSV)
-    y, x, _ = kare.shape
-    merkez = x // 2
+    H, W = kare.shape[:2]
 
-    # --- 1. GELİŞMİŞ KIRMIZI IŞIK VE TABELA ANALİZİ ---
-    m_kirmizi1 = cv2.inRange(hsv, np.array([0, 120, 70]), np.array([10, 255, 255]))
-    m_kirmizi2 = cv2.inRange(hsv, np.array([160, 120, 70]), np.array([179, 255, 255]))
-    maske_kirmizi = m_kirmizi1 + m_kirmizi2
+    # ADIM 1: ALGI (Dünyayı gözlemle)
+    isik_durumu = kirmizi_isik_analiz(kare, hsv)
+    tabela_durumu = tabela_analiz(kare, hsv)
+    hata, lx, rx, yo = serit_takip_analiz(hsv)
+
+    # ADIM 2: KARAR (Ne yapacağına karar ver)
+    emir = karar_verici(isik_durumu, tabela_durumu, hata)
+
+    # ADIM 3: GÖRSELLEŞTİRME (Kullanıcı için çizimler)
+    # Şerit noktaları
+    if lx != -1: cv2.circle(kare, (lx, H-30), 8, (255,0,0), -1)
+    if rx != W: cv2.circle(kare, (rx, H-30), 8, (0,0,255), -1)
+    cv2.circle(kare, (yo, H-30), 12, (0,255,0), -1)
     
-    isik_durumu = "YOK"
-    kirmizi_tabela_tipi = "YOK"
+    # Emir ve Durum Yazısı
+    renk = (0,0,255) if emir == "DUR" else (0,255,0)
+    cv2.putText(kare, f"KOMUT: {emir}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, renk, 3)
 
-    konturlar_k, _ = cv2.findContours(maske_kirmizi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for c_k in konturlar_k:
-        alan_k = cv2.contourArea(c_k)
-        if alan_k > 1500:
-            cevre_k = cv2.arcLength(c_k, True)
-            yaklasik = cv2.approxPolyDP(c_k, 0.04 * cevre_k, True)
-            kenar_sayisi = len(yaklasik)
-            xk, yk, wk, hk = cv2.boundingRect(c_k)
-            
-            # ÜÇGEN KONTROLÜ (Kenar sayısı 3 veya gürültüyle 4 ise)
-            if 3 <= kenar_sayisi < 4:
-                kirmizi_tabela_tipi = "UCGEN TABELA (DIKKAT)"
-                cv2.rectangle(kare, (xk, yk), (xk+wk, yk+hk), (0, 165, 255), 2)
-
-            elif kenar_sayisi == 4:
-                kirmizi_tabela_tipi = "KIRMIZI KARE"
-                cv2.rectangle(kare, (xk, yk), (xk+wk, yk+hk), (0, 165, 255), 2)
-            
-            # DAİRESEL ŞEKİLLER (Işık mı yoksa Halka Tabela mı?)
-            else:
-                circularity_k = (4 * np.pi * alan_k) / (cevre_k * cevre_k)
-                if circularity_k > 0.7:
-                    # MERKEZ DOLULUK TESTİ (Işık içi doludur, tabela içi boştur)
-                    mx, my = xk + wk//2, yk + hk//2
-                    # Merkezin 5x5 piksellik alanına bakıyoruz
-                    merkez_bolge = maske_kirmizi[max(0, my-5):min(y, my+5), max(0, mx-5):min(x, mx+5)]
-                    
-                    if cv2.countNonZero(merkez_bolge) > 15:
-                        isik_durumu = "KIRMIZI" # İçi dolu, bu bir trafik ışığı
-                        cv2.rectangle(kare, (xk, yk), (xk+wk, yk+hk), (0, 0, 255), 3)
-                    else:
-                        kirmizi_tabela_tipi = "YASAK / HIZ TABELASI" # İçi boş halka
-                        cv2.rectangle(kare, (xk, yk), (xk+wk, yk+hk), (255, 0, 255), 2)
-
-    # --- 2. DİĞER IŞIKLAR (SARI VE YEŞİL) ---
-    maske_sari = cv2.inRange(hsv, np.array([20, 100, 100]), np.array([35, 255, 255]))
-    maske_yesil = cv2.inRange(hsv, np.array([40, 100, 100]), np.array([90, 255, 255]))
-    
-    if isik_durumu == "YOK":
-        if np.sum(maske_sari) > 1000000: isik_durumu = "SARI"
-        elif np.sum(maske_yesil) > 1000000: isik_durumu = "YESIL"
-
-    # --- 3. MAVİ TABELA ALGILAMA (DAİRE TESTLİ) ---
-    m_mavi = cv2.inRange(hsv, np.array([100,150,50]), np.array([140,255,255]))
-    konturlar_m, _ = cv2.findContours(m_mavi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    tabela_karari = "YOK"
-    for c_m in konturlar_m:
-        alan_m = cv2.contourArea(c_m)
-        cevre_m = cv2.arcLength(c_m, True)
-        if alan_m > 2000 and cevre_m > 0:
-            circ_m = (4 * np.pi * alan_m) / (cevre_m * cevre_m)
-            if circ_m > 0.65:
-                tx, ty, tw, th = cv2.boundingRect(c_m)
-                t_ici = m_mavi[ty:ty+th, tx:tx+tw]
-                sol_p = cv2.countNonZero(t_ici[:, 0:tw//2])
-                sag_p = cv2.countNonZero(t_ici[:, tw//2:tw])
-                if sol_p > sag_p + 150: tabela_karari = "SOLA DON"
-                elif sag_p > sol_p + 150: tabela_karari = "SAGA DON"
-                cv2.rectangle(kare, (tx, ty), (tx+tw, ty+th), (255, 255, 0), 2)
-
-    # --- 4. ŞERİT TAKİBİ ---
-    roi = hsv[int(y*0.75):y, 0:x]
-    m_siyah = cv2.inRange(roi, np.array([0,0,0]), np.array([180,255,40]))
-    sol_t = m_siyah[:, 0:merkez]; sag_t = m_siyah[:, merkez:x]
-    lcx, rcx = -1, -1
-
-    def merkez_bul(taraf):
-        k, _ = cv2.findContours(taraf, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if k:
-            en_b = max(k, key=cv2.contourArea)
-            if cv2.contourArea(en_b) > 500:
-                M = cv2.moments(en_b)
-                if M["m00"] > 0: return int(M["m10"]/M["m00"])
-        return -1
-
-    lcx = merkez_bul(sol_t)
-    rcx_h = merkez_bul(sag_t)
-    if rcx_h != -1: rcx = rcx_h + merkez
-
-    if lcx != -1 and rcx != -1: yol_o = (lcx + rcx) // 2
-    elif lcx != -1: yol_o = lcx + 100
-    elif rcx != -1: yol_o = rcx - 100
-    else: yol_o = merkez
-    hata = yol_o - merkez
-
-    # --- 5. GÖRSELLEŞTİRME VE KARAR ---
-    if lcx != -1: cv2.circle(kare, (lcx, y-30), 10, (255, 0, 0), -1) # Sol (Mavi)
-    if rcx != -1: cv2.circle(kare, (rcx, y-30), 10, (0, 0, 255), -1) # Sağ (Kırmızı)
-    cv2.circle(kare, (yol_o, y-30), 12, (0, 255, 0), -1)           # Hedef (Yeşil)
-
-    if isik_durumu == "KIRMIZI":
-        mesaj, renk = "DUR: KIRMIZI ISIK!", (0,0,255)
-    elif isik_durumu == "SARI":
-        mesaj, renk = "YAVASLA: SARI ISIK", (0,255,255)
-    elif isik_durumu == "YESIL":
-        mesaj, renk = "YOL ACIK: YESIL ISIK", (0,255,0)
-    elif kirmizi_tabela_tipi != "YOK":
-        mesaj, renk = kirmizi_tabela_tipi, (0,165,255)
-    elif tabela_karari != "YOK":
-        mesaj, renk = f"TABELA: {tabela_karari}", (255, 255, 0)
-    elif lcx == -1 and rcx == -1:
-        mesaj, renk = "YOL KAYIP!", (255, 255, 255)
-    elif hata < -30: mesaj, renk = "SOLA KIR", (0, 255, 0)
-    elif hata > 30: mesaj, renk = "SAGA KIR", (0, 255, 0)
-    else: mesaj, renk = "DUZ GIT", (0, 255, 0)
-
-    cv2.putText(kare, mesaj, (20, 45), 1, 2, renk, 2)
-    cv2.imshow("MEB Otonom Arac v3.2 - Akilli Sistem", kare)
+    cv2.imshow("MEB Otonom Arac v4.2 - Pro", kare)
     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
 kamera.release()
