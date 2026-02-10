@@ -1,153 +1,168 @@
 import cv2
 import numpy as np
 
-# --- GLOBAL DEĞİŞKENLER (Robotun Hafızası) ---
-kirmizi_sayaci = 0 
+# --- GLOBAL HAFIZA (Robotun Belleği ve Sayaçları) ---
+lane_memory = {
+    "left":  {"x": None, "confidence": 0},
+    "right": {"x": None, "confidence": 0}
+}
+MAX_CONF = 5
+kirmizi_sayaci = 0
+son_hata = 0
 
-# --- ALGI KATMANI (Perception Layer) ---
+# --- 1. ALGI KATMANI: GELİŞMİŞ ŞERİT ANALİZİ (v4.5 - Lane ID & Adaptive Mask) ---
+
+def adaptive_lane_mask(v_channel):
+    """Satır bazlı, standart sapmalı adaptif eşikleme (Işık değişimlerine dirençli)."""
+    h, w = v_channel.shape
+    maske = np.zeros_like(v_channel)
+    for y in range(0, h, 5):
+        row = v_channel[y:y+5]
+        # Bölgesel parlaklık analizi
+        thresh = np.mean(row) - 1.0 * np.std(row)
+        maske[y:y+5] = cv2.inRange(v_channel[y:y+5], 0, thresh)
+    return maske
+
+def serit_takip_v45(frame, hsv_frame):
+    global lane_memory, son_hata
+    H, W = frame.shape[:2]
+
+    # ROI: Yola odaklan (Alt kısım)
+    roi_w_start = int(W*0.1)
+    roi_hsv = hsv_frame[int(H*0.7):H, roi_w_start:int(W*0.9)]
+    v = roi_hsv[:,:,2]
+
+    blur = cv2.GaussianBlur(v, (5,5), 0)
+    maske = adaptive_lane_mask(blur)
+    
+    # --- ROBOTUN GÖZÜ 1: YOL MASKE ---
+    cv2.imshow("Robot Gozu: Yol Maskesi", maske)
+
+    kernel = np.ones((5,5), np.uint8)
+    maske = cv2.morphologyEx(maske, cv2.MORPH_OPEN, kernel)
+
+    konturlar, _ = cv2.findContours(maske, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for c in konturlar:
+        if cv2.contourArea(c) > 400:
+            x, y, w, h = cv2.boundingRect(c)
+            candidates.append(x + w//2)
+
+    # --- KİMLİK EŞLEŞTİRME (ID Tracking) ---
+    for side in ["left", "right"]:
+        lane_memory[side]["confidence"] = max(0, lane_memory[side]["confidence"] - 1)
+
+    for cx in candidates:
+        if lane_memory["left"]["x"] is None and lane_memory["right"]["x"] is None:
+            side = "left" if cx < maske.shape[1] // 2 else "right"
+        else:
+            l_dist = abs(cx - lane_memory["left"]["x"]) if lane_memory["left"]["x"] is not None else 9999
+            r_dist = abs(cx - lane_memory["right"]["x"]) if lane_memory["right"]["x"] is not None else 9999
+            side = "left" if l_dist < r_dist else "right"
+
+        lane_memory[side]["x"] = cx
+        lane_memory[side]["confidence"] = min(MAX_CONF, lane_memory[side]["confidence"] + 2)
+
+    lx, rx = lane_memory["left"]["x"], lane_memory["right"]["x"]
+    current_w = abs(rx - lx) if (lx is not None and rx is not None) else 320
+    
+    if lane_memory["left"]["confidence"] >= 2 and lane_memory["right"]["confidence"] >= 2:
+        yol_merkez = (lx + rx) // 2
+    elif lane_memory["left"]["confidence"] >= 2:
+        yol_merkez = lx + (current_w // 2)
+    elif lane_memory["right"]["confidence"] >= 2:
+        yol_merkez = rx - (current_w // 2)
+    else:
+        yol_merkez = maske.shape[1] // 2
+
+    hata = yol_merkez - (maske.shape[1] // 2)
+    son_hata = int(0.7 * son_hata + 0.3 * hata) 
+    return son_hata, lx, rx, yol_merkez, roi_w_start
+
+# --- 2. ALGI KATMANI: KIRMIZI IŞIK ANALİZİ (Gelişmiş Filtreli) ---
 
 def kirmizi_isik_analiz(frame, hsv_frame):
-    """Kırmızı ışığı; renk, konum, yuvarlaklık, oran ve boyut testlerinden geçirir."""
     global kirmizi_sayaci
-    
-    # 1. Renk Süzgeci
+    H, W = frame.shape[:2]
     m1 = cv2.inRange(hsv_frame, np.array([0, 120, 70]), np.array([10, 255, 255]))
     m2 = cv2.inRange(hsv_frame, np.array([160, 120, 70]), np.array([179, 255, 255]))
     maske = m1 + m2
     
+    # --- ROBOTUN GÖZÜ 2: KIRMIZI MASKESİ ---
+    cv2.imshow("Robot Gozu: Kirmizi Filtre", maske)
+
     konturlar, _ = cv2.findContours(maske, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    isik_tespit_edildi = False
-    
+    tespit = False
     for c in konturlar:
         alan = cv2.contourArea(c)
-        cevre = cv2.arcLength(c, True)
-        
-        # A. Boyut Filtresi (Çok küçük gürültüleri ve aşırı büyük hataları eler)
-        if 1000 < alan < (frame.shape[0] * frame.shape[1] // 4):
-            if cevre > 0:
-                # B. Yuvarlaklık Testi (Circularity)
-                yuvarlaklik = (4 * np.pi * alan) / (cevre * cevre)
-                
-                if yuvarlaklik > 0.7:
-                    xk, yk, wk, hk = cv2.boundingRect(c)
-                    
-                    # C. Oran Kontrolü (Aspect Ratio - Kareye yakın olmalı)
-                    oran = float(wk) / hk
-                    if 0.7 < oran < 1.3:
-                        
-                        # D. Konum Kontrolü (Ekranın üst kısmında mı?)
-                        if yk < frame.shape[0] * 0.6:
-                            
-                            # E. Merkez Doluluk Testi (Hız tabelasından ayırmak için)
-                            mx, my = xk + wk//2, yk + hk//2
-                            merkez_bolge = maske[max(0, my-5):min(frame.shape[0], my+5), 
-                                                 max(0, mx-5):min(frame.shape[1], mx+5)]
-                            
-                            if cv2.countNonZero(merkez_bolge) > 15:
-                                isik_tespit_edildi = True
-                                # Tespit edilen ışığı kare içine alalım
-                                cv2.rectangle(frame, (xk, yk), (xk+wk, yk+hk), (0, 0, 255), 2)
-                                break 
-
-    # F. Güven Filtresi (Temporal Filtering - Arka arkaya 3 kare görme şartı)
-    if isik_tespit_edildi:
-        kirmizi_sayaci += 1
-    else:
-        kirmizi_sayaci = 0 
-    
+        if alan > 1000:
+            cevre = cv2.arcLength(c, True)
+            if cevre > 0 and (4*np.pi*alan)/(cevre*cevre) > 0.7:
+                xk, yk, wk, hk = cv2.boundingRect(c)
+                oran = float(wk) / hk
+                if 0.7 < oran < 1.3 and yk < H*0.6:
+                    # Doluluk Testi (Hız tabelasını eler)
+                    mx, my = xk + wk//2, yk + hk//2
+                    merkez_b = maske[max(0,my-5):min(H,my+5), max(0,mx-5):min(W,mx+5)]
+                    if cv2.countNonZero(merkez_b) > 15:
+                        tespit = True
+                        cv2.rectangle(frame, (xk, yk), (xk+wk, yk+hk), (0, 0, 255), 2)
+                        break
+    if tespit: kirmizi_sayaci += 1
+    else: kirmizi_sayaci = 0
     return kirmizi_sayaci >= 3
 
+# --- 3. ALGI KATMANI: TABELA ---
+
 def tabela_analiz(frame, hsv_frame):
-    """Mavi tabelayı ve içindeki okun yönünü analiz eder."""
-    alt_mavi = np.array([100, 150, 50])
-    ust_mavi = np.array([140, 255, 255])
-    maske = cv2.inRange(hsv_frame, alt_mavi, ust_mavi)
+    maske = cv2.inRange(hsv_frame, np.array([100, 150, 50]), np.array([140, 255, 255]))
     
+    # --- ROBOTUN GÖZÜ 3: MAVİ MASKE ---
+    cv2.imshow("Robot Gozu: Tabela Filtre", maske)
+
     konturlar, _ = cv2.findContours(maske, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for c in konturlar:
-        alan = cv2.contourArea(c)
-        if alan > 2500:
-            cevre = cv2.arcLength(c, True)
-            circ = (4 * np.pi * alan) / (cevre * cevre)
-            if circ > 0.65: # Sadece dairesel nesneler
-                tx, ty, tw, th = cv2.boundingRect(c)
-                t_ici = maske[ty:ty+th, tx:tx+tw]
-                sol = cv2.countNonZero(t_ici[:, 0:tw//2])
-                sag = cv2.countNonZero(t_ici[:, tw//2:tw])
-                cv2.rectangle(frame, (tx, ty), (tx+tw, ty+th), (255, 255, 0), 2)
-                return "SOLA_DON" if sol > sag + 150 else "SAGA_DON"
+        if cv2.contourArea(c) > 2500:
+            tx, ty, tw, th = cv2.boundingRect(c)
+            t_ici = maske[ty:ty+th, tx:tx+tw]
+            sol, sag = cv2.countNonZero(t_ici[:, 0:tw//2]), cv2.countNonZero(t_ici[:, tw//2:tw])
+            cv2.rectangle(frame, (tx, ty), (tx+tw, ty+th), (255, 255, 0), 2)
+            return "SOLA_DON" if sol > sag + 150 else "SAGA_DON"
     return "YOK"
 
-def serit_takip_analiz(hsv_frame):
-    """Yoldaki şeritleri bulur ve sapma (hata) miktarını hesaplar."""
-    H, W = hsv_frame.shape[:2]
-    roi = hsv_frame[int(H*0.75):H, 0:W]
-    maske = cv2.inRange(roi, np.array([0,0,0]), np.array([180,255,40]))
-    
-    def merkez_bul(taraf):
-        k, _ = cv2.findContours(taraf, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if k:
-            b = max(k, key=cv2.contourArea)
-            if cv2.contourArea(b) > 500:
-                M = cv2.moments(b)
-                if M["m00"] > 0: return int(M["m10"]/M["m00"])
-        return -1
+# --- 4. KARAR KATMANI ---
 
-    lcx = merkez_bul(maske[:, 0:W//2])
-    rcx_ham = merkez_bul(maske[:, W//2:W])
-    rcx = rcx_ham + W//2 if rcx_ham != -1 else W
-    
-    yol_o = (lcx + rcx) // 2 if (lcx != -1 and rcx != W) else W//2
-    return yol_o - (W // 2), lcx, rcx, yol_o
+def karar_merkezi(isik, tabela, hata):
+    if isik: return "DUR", (0, 0, 255)
+    if tabela != "YOK": return tabela, (255, 255, 0)
+    if hata < -30: return "SOLA_KIR", (0, 255, 0)
+    if hata > 30: return "SAGA_KIR", (0, 255, 0)
+    return "DUZ_GIT", (0, 255, 0)
 
-# --- KARAR KATMANI (Decision Layer) ---
-
-def karar_verici(isik_var, tabela_yon, serit_hatasi):
-    """Tüm algılardan gelen verileri birleştirip tek bir emir üretir (Hiyerarşik)."""
-    # 1. Öncelik: Güvenlik (Kırmızı Işık)
-    if isik_var:
-        return "DUR"
-    
-    # 2. Öncelik: Tabelalar (Manüel Yönlendirme)
-    if tabela_yon != "YOK":
-        return tabela_yon
-    
-    # 3. Öncelik: Otonom Şerit Takibi
-    if serit_hatasi < -30: return "SOLA_KIR"
-    if serit_hatasi > 30: return "SAGA_KIR"
-    
-    return "DUZ_GIT"
-
-# --- UYGULAMA KATMANI (Main Loop) ---
+# --- 5. ANA DÖNGÜ ---
 
 kamera = cv2.VideoCapture(0)
-
 while True:
     ret, kare = kamera.read()
     if not ret: break
-    kare = cv2.flip(kare, 1) # Bilgisayar testi için ayna modu
+    kare = cv2.flip(kare, 1)
     hsv = cv2.cvtColor(kare, cv2.COLOR_BGR2HSV)
     H, W = kare.shape[:2]
 
-    # ADIM 1: ALGI (Dünyayı gözlemle)
-    isik_durumu = kirmizi_isik_analiz(kare, hsv)
-    tabela_durumu = tabela_analiz(kare, hsv)
-    hata, lx, rx, yo = serit_takip_analiz(hsv)
+    hata, lx, rx, yo, r_start = serit_takip_v45(kare, hsv)
+    isik_var = kirmizi_isik_analiz(kare, hsv)
+    tabela_durum = tabela_analiz(kare, hsv)
+    emir, renk = karar_merkezi(isik_var, tabela_durum, hata)
 
-    # ADIM 2: KARAR (Ne yapacağına karar ver)
-    emir = karar_verici(isik_durumu, tabela_durumu, hata)
-
-    # ADIM 3: GÖRSELLEŞTİRME (Kullanıcı için çizimler)
-    # Şerit noktaları
-    if lx != -1: cv2.circle(kare, (lx, H-30), 8, (255,0,0), -1)
-    if rx != W: cv2.circle(kare, (rx, H-30), 8, (0,0,255), -1)
-    cv2.circle(kare, (yo, H-30), 12, (0,255,0), -1)
+    # Görselleştirme
+    if lx is not None and lane_memory["left"]["confidence"] >= 2:
+        cv2.circle(kare, (r_start + lx, int(H*0.85)), 10, (255, 0, 0), -1)
+    if rx is not None and lane_memory["right"]["confidence"] >= 2:
+        cv2.circle(kare, (r_start + rx, int(H*0.85)), 10, (0, 0, 255), -1)
+    cv2.circle(kare, (r_start + yo, int(H*0.85)), 12, (0, 255, 0), -1)
     
-    # Emir ve Durum Yazısı
-    renk = (0,0,255) if emir == "DUR" else (0,255,0)
-    cv2.putText(kare, f"KOMUT: {emir}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, renk, 3)
-
-    cv2.imshow("MEB Otonom Arac v4.2 - Pro", kare)
+    cv2.putText(kare, f"KOMUT: {emir}", (20, 50), 1, 2, renk, 3)
+    cv2.imshow("MEB Otonom Arac v4.5 FULL", kare)
     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
 kamera.release()
