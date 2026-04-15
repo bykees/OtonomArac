@@ -4,22 +4,27 @@ import numpy as np
 
 class OtonomSurusSistemi:
     def __init__(self, camera_index=0, debug=False):
+        self.camera_index = camera_index
         self.DEBUG = debug
 
         # --- Parametreler ---
         self.MAX_CONF = 5
         self.DEFAULT_LANE_WIDTH = 160
         self.LANE_MIN_AREA = 300
-        self.RED_MIN_AREA = 1000
-        self.BLUE_MIN_AREA = 1500
+        self.RED_MIN_AREA = 600
+        self.BLUE_MIN_AREA = 1800
         self.TURN_ERROR_THRESHOLD = 25
 
         self.LANE_STD_COEF = 0.9
-
         self.RED_CONFIRM_FRAMES = 3
-        self.SIGN_CONFIRM_FRAMES = 3
+        self.SIGN_CONFIRM_FRAMES = 4
 
-        self.LANE_SMOOTH_ALPHA = 0.3
+        self.LANE_SMOOTH_ALPHA = 0.30
+        self.ERROR_SMOOTH_ALPHA = 0.35
+
+        # Ok yönü tahmini için
+        self.ARROW_MIN_WHITE_AREA = 120
+        self.ARROW_CENTER_MARGIN = 0.08  # merkeze çok yakınsa karar verme
 
         # --- Durum hafızası ---
         self.lane_memory = {
@@ -28,305 +33,461 @@ class OtonomSurusSistemi:
         }
 
         self.last_lane_width = self.DEFAULT_LANE_WIDTH
+        self.last_error = 0
+
         self.kirmizi_sayaci = 0
         self.tabela_sayaci = 0
         self.son_tabela = "YOK"
-        self.son_hata = 0
 
-        # --- Kamera ---
-        self.kamera = cv2.VideoCapture(camera_index)
-        if not self.kamera.isOpened():
-            raise RuntimeError("Kamera acilamadi")
+    # -------------------------------------------------
+    # Yardımcı fonksiyonlar
+    # -------------------------------------------------
+    def smooth_value(self, old, new, alpha=None):
+        if alpha is None:
+            alpha = self.LANE_SMOOTH_ALPHA
+        if old is None:
+            return int(new)
+        return int(alpha * new + (1 - alpha) * old)
 
-        self.kamera.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-        self.kamera.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+    def update_lane_memory(self, side, x_value):
+        if x_value is not None:
+            self.lane_memory[side]["x"] = self.smooth_value(
+                self.lane_memory[side]["x"], x_value
+            )
+            self.lane_memory[side]["confidence"] = min(
+                self.MAX_CONF, self.lane_memory[side]["confidence"] + 1
+            )
+        else:
+            self.lane_memory[side]["confidence"] = max(
+                0, self.lane_memory[side]["confidence"] - 1
+            )
+            if self.lane_memory[side]["confidence"] == 0:
+                self.lane_memory[side]["x"] = None
 
-    # --- 1. ŞERİT MASKESİ ---
     def adaptive_lane_mask(self, v_channel):
         h, w = v_channel.shape
-        maske = np.zeros_like(v_channel)
+        mask = np.zeros_like(v_channel)
 
         for y in range(0, h, 5):
             row = v_channel[y:y + 5]
-            thresh = np.mean(row) - self.LANE_STD_COEF * np.std(row)       
-            thresh = max(0, min(255, int(thresh)))
-            maske[y:y + 5] = cv2.inRange(v_channel[y:y + 5], 0, thresh)
+            if row.size == 0:
+                continue
 
-        return maske
-
-    # --- 2. ŞERİT TAKİBİ ---
-    def serit_takip(self, frame, hsv_frame):
-        H, W = frame.shape[:2]
-
-        roi_w_start = int(W * 0.1)
-        roi_w_end = int(W * 0.9)
-        roi_h_start = int(H * 0.7)
-
-        roi_hsv = hsv_frame[roi_h_start:H, roi_w_start:roi_w_end]
-        v = roi_hsv[:, :, 2]
-
-        blur_v = cv2.GaussianBlur(v, (5, 5), 0)
-        maske = self.adaptive_lane_mask(blur_v)
+            thresh = np.mean(row) - self.LANE_STD_COEF * np.std(row)
+            mask[y:y + 5] = np.where(row < thresh, 255, 0)
 
         kernel = np.ones((5, 5), np.uint8)
-        maske = cv2.morphologyEx(maske, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        konturlar, _ = cv2.findContours(maske, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return mask
 
-        best_left, best_right = None, None
-        max_l_area, max_r_area = 0, 0
+    def find_lane_points(self, mask):
+        h, w = mask.shape
 
-        for c in konturlar:
-            area = cv2.contourArea(c)
-            if area <= self.LANE_MIN_AREA:
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        left_x = None
+        right_x = None
+        left_best_area = 0
+        right_best_area = 0
+        merkez = w // 2
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < self.LANE_MIN_AREA:
                 continue
 
-            x, y, w, h = cv2.boundingRect(c)
-            cx = x + w // 2
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            cx = x + cw // 2
 
-            if cx < maske.shape[1] // 2:
-                if area > max_l_area:
-                    max_l_area = area
-                    best_left = cx
+            if cx < merkez:
+                if area > left_best_area:
+                    left_best_area = area
+                    left_x = cx
             else:
-                if area > max_r_area:
-                    max_r_area = area
-                    best_right = cx
+                if area > right_best_area:
+                    right_best_area = area
+                    right_x = cx
 
-        # Hafıza güncelleme
-        for side, current_x in [("left", best_left), ("right", best_right)]:
-            if current_x is not None:
-                self.lane_memory[side]["x"] = current_x
-                self.lane_memory[side]["confidence"] = min(
-                    self.MAX_CONF,
-                    self.lane_memory[side]["confidence"] + 2
+        return left_x, right_x
+
+    def get_lane_center(self, left_x, right_x, frame_width):
+        self.update_lane_memory("left", left_x)
+        self.update_lane_memory("right", right_x)
+
+        left = self.lane_memory["left"]["x"]
+        right = self.lane_memory["right"]["x"]
+
+        if left is not None and right is not None:
+            measured_width = right - left
+            if measured_width > 60:
+                self.last_lane_width = int(
+                    0.9 * self.last_lane_width + 0.1 * measured_width
                 )
-            else:
-                self.lane_memory[side]["confidence"] = max(
-                    0,
-                    self.lane_memory[side]["confidence"] - 1
-                )
-                if self.lane_memory[side]["confidence"] == 0:
-                    self.lane_memory[side]["x"] = None
 
-        lx = self.lane_memory["left"]["x"]
-        rx = self.lane_memory["right"]["x"]
+        if left is None and right is not None:
+            left = right - self.last_lane_width
+        elif right is None and left is not None:
+            right = left + self.last_lane_width
 
-        left_ok = self.lane_memory["left"]["confidence"] >= 2 and lx is not None
-        right_ok = self.lane_memory["right"]["confidence"] >= 2 and rx is not None
+        if left is None and right is None:
+            return frame_width // 2, None, None
 
-        # Son geçerli şerit genişliğini koru
-        if left_ok and right_ok:
-            self.last_lane_width = abs(rx - lx)
+        lane_center = (left + right) // 2
+        return lane_center, left, right
 
-        current_w = self.last_lane_width if self.last_lane_width is not None else self.DEFAULT_LANE_WIDTH
+    def detect_red_light(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # Yol merkezi hesabı
-        if left_ok and right_ok:
-            yol_merkez = (lx + rx) // 2
-        elif left_ok:
-            yol_merkez = lx + (current_w // 2)
-        elif right_ok:
-            yol_merkez = rx - (current_w // 2)
+        lower_red1 = np.array([0, 100, 100])
+        upper_red1 = np.array([10, 255, 255])
+
+        lower_red2 = np.array([160, 100, 100])
+        upper_red2 = np.array([179, 255, 255])
+
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        red_mask = cv2.bitwise_or(mask1, mask2)
+
+        kernel = np.ones((5, 5), np.uint8)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(
+            red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        red_detected = False
+        best_box = None
+        best_area = 0
+
+        frame_h, frame_w = frame.shape[:2]
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < self.RED_MIN_AREA:
+                continue
+
+            x, y, w, h = cv2.boundingRect(cnt)
+
+            if y > int(frame_h * 0.55):
+                continue
+
+            aspect_ratio = w / float(h)
+            if aspect_ratio < 0.5 or aspect_ratio > 1.5:
+                continue
+
+            rect_area = w * h
+            if rect_area <= 0:
+                continue
+
+            fill_ratio = area / float(rect_area)
+            if fill_ratio < 0.45:
+                continue
+
+            if area > best_area:
+                best_box = (x, y, w, h)
+                best_area = area
+                red_detected = True
+
+        if red_detected:
+            self.kirmizi_sayaci += 1
         else:
-            yol_merkez = maske.shape[1] // 2
+            self.kirmizi_sayaci = max(0, self.kirmizi_sayaci - 1)
 
-        hata = yol_merkez - (maske.shape[1] // 2)
-        self.son_hata = int((1 - self.LANE_SMOOTH_ALPHA) * self.son_hata + self.LANE_SMOOTH_ALPHA * hata)
+        return self.kirmizi_sayaci >= self.RED_CONFIRM_FRAMES, best_box
 
-        return self.son_hata, lx, rx, yol_merkez, roi_w_start, roi_h_start, maske
+    def detect_arrow_direction(self, sign_roi):
+        """
+        Mavi tabela içindeki beyaz oku yaklaşık olarak yön tayini eder.
+        Çalışma mantığı:
+        - Beyaz alanı çıkar
+        - En büyük beyaz contour'u bul
+        - Contour ağırlık merkezini ROI merkezine göre karşılaştır
+        """
 
-    # --- 3. KIRMIZI IŞIK ANALİZİ ---
-    def kirmizi_isik_analiz(self, frame, hsv_frame):
-        H, W = frame.shape[:2]
+        if sign_roi is None or sign_roi.size == 0:
+            return "YOK", None
 
-        mask1 = cv2.inRange(hsv_frame, np.array([0, 120, 70]), np.array([10, 255, 255]))
-        mask2 = cv2.inRange(hsv_frame, np.array([160, 120, 70]), np.array([179, 255, 255]))
-        m = mask1 + mask2
+        hsv = cv2.cvtColor(sign_roi, cv2.COLOR_BGR2HSV)
 
-        konturlar, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Beyaz sembol maskesi
+        lower_white = np.array([0, 0, 160])
+        upper_white = np.array([179, 90, 255])
+        white_mask = cv2.inRange(hsv, lower_white, upper_white)
 
-        tespit = False
+        kernel = np.ones((3, 3), np.uint8)
+        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
 
-        for c in konturlar:
-            area = cv2.contourArea(c)
-            if area <= self.RED_MIN_AREA:
-                continue
+        contours, _ = cv2.findContours(
+            white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
-            cevre = cv2.arcLength(c, True)
-            if cevre <= 0:
-                continue
+        if not contours:
+            return "YOK", white_mask
 
-            dairesellik = (4 * np.pi * area) / (cevre * cevre)
-            if dairesellik <= 0.7:
-                continue
+        best_cnt = None
+        best_area = 0
 
-            xk, yk, wk, hk = cv2.boundingRect(c)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > best_area and area > self.ARROW_MIN_WHITE_AREA:
+                best_area = area
+                best_cnt = cnt
 
-            if not (0.7 < (float(wk) / max(hk, 1)) < 1.3):
-                continue
+        if best_cnt is None:
+            return "YOK", white_mask
 
-            if yk >= H * 0.6:
-                continue
+        M = cv2.moments(best_cnt)
+        if M["m00"] == 0:
+            return "YOK", white_mask
 
-            mx, my = xk + wk // 2, yk + hk // 2
-            roi = m[max(0, my - 3):min(H, my + 3), max(0, mx - 3):min(W, mx + 3)]
+        cx = int(M["m10"] / M["m00"])
+        h, w = white_mask.shape[:2]
+        center_x = w // 2
 
-            if cv2.countNonZero(roi) > 5:
-                tespit = True
-                break
+        normalized_offset = (cx - center_x) / float(w)
 
-        self.kirmizi_sayaci = self.kirmizi_sayaci + 1 if tespit else 0
-        return self.kirmizi_sayaci >= self.RED_CONFIRM_FRAMES
+        if normalized_offset < -self.ARROW_CENTER_MARGIN:
+            return "SOL", white_mask
+        elif normalized_offset > self.ARROW_CENTER_MARGIN:
+            return "SAG", white_mask
+        else:
+            return "YOK", white_mask
 
-    # --- 4. TABELA ANALİZİ ---
-    def tabela_analiz(self, frame, hsv_frame):
-        H, W = frame.shape[:2]
+    def detect_blue_sign(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        maske_mavi = cv2.inRange(hsv_frame, np.array([90, 100, 50]), np.array([145, 255, 255]))
-        konturlar, _ = cv2.findContours(maske_mavi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        lower_blue = np.array([90, 80, 50])
+        upper_blue = np.array([130, 255, 255])
 
-        anlik_tabela = "YOK"
+        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
 
-        for c in konturlar:
-            area = cv2.contourArea(c)
+        kernel = np.ones((5, 5), np.uint8)
+        blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
+        blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(
+            blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        sign_detected = False
+        sign_box = None
+        best_area = 0
+        detected_sign = "YOK"
+
+        frame_h, frame_w = frame.shape[:2]
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
             if area < self.BLUE_MIN_AREA:
                 continue
 
-            cevre = cv2.arcLength(c, True)
-            if cevre == 0:
+            x, y, w, h = cv2.boundingRect(cnt)
+
+            # Tabela yaklaşık kare olmalı
+            aspect_ratio = w / float(h)
+            if aspect_ratio < 0.70 or aspect_ratio > 1.30:
                 continue
 
-            dairesellik = (4 * np.pi * area) / (cevre * cevre)
-            if dairesellik < 0.65:
+            # Çok aşağıdaki mavi bölgeleri ele
+            if y > int(frame_h * 0.70):
                 continue
 
-            (x, y), radius = cv2.minEnclosingCircle(c)
-            if radius < 20:
+            rect_area = w * h
+            if rect_area <= 0:
                 continue
 
-            x1 = max(int(x - radius), 0)
-            y1 = max(int(y - radius), 0)
-            x2 = min(int(x + radius), W)
-            y2 = min(int(y + radius), H)
-
-            roi_hsv = hsv_frame[y1:y2, x1:x2]
-            if roi_hsv.size == 0:
+            fill_ratio = area / float(rect_area)
+            if fill_ratio < 0.50:
                 continue
 
-            roi_hsv = cv2.resize(roi_hsv, (100, 100))
+            # En iyi adayı seç
+            if area > best_area:
+                # Tabela ROI
+                sign_roi = frame[y:y + h, x:x + w]
 
-            circle_mask = np.zeros((100, 100), dtype=np.uint8)
-            cv2.circle(circle_mask, (50, 50), 45, 255, -1)
+                # İçerikteki okun yönünü analiz et
+                arrow_dir, _ = self.detect_arrow_direction(sign_roi)
 
-            # Beyaz/gri ok alanı
-            ok_mask = cv2.inRange(
-                roi_hsv,
-                np.array([0, 0, 150]),
-                np.array([180, 85, 255])
-            )
-            ok_mask = cv2.bitwise_and(ok_mask, circle_mask)
+                # Gerçekten okun yönü çıkarılamadıysa bu adayı kullanma
+                if arrow_dir == "YOK":
+                    continue
 
-            # Gürültü azalt
-            kernel = np.ones((3, 3), np.uint8)
-            ok_mask = cv2.morphologyEx(ok_mask, cv2.MORPH_OPEN, kernel)
-            ok_mask = cv2.morphologyEx(ok_mask, cv2.MORPH_CLOSE, kernel)
+                best_area = area
+                sign_box = (x, y, w, h)
+                detected_sign = arrow_dir
+                sign_detected = True
 
-            if self.DEBUG:
-                cv2.imshow("Goz: Tabela Ok Maskesi", ok_mask)
-
-            sol_yari = cv2.countNonZero(ok_mask[:, 0:45])
-            sag_yari = cv2.countNonZero(ok_mask[:, 55:100])
-
-            if sol_yari > sag_yari + 100:
-                anlik_tabela = "SOLA_DON"
-                cv2.circle(frame, (int(x), int(y)), int(radius), (255, 255, 0), 2)
-                break
-            elif sag_yari > sol_yari + 100:
-                anlik_tabela = "SAGA_DON"
-                cv2.circle(frame, (int(x), int(y)), int(radius), (0, 255, 255), 2)
-                break
-
-        # Ardışık doğrulama
-        if anlik_tabela != "YOK":
-            if anlik_tabela == self.son_tabela:
+        if sign_detected:
+            if detected_sign == self.son_tabela:
                 self.tabela_sayaci += 1
             else:
-                self.son_tabela = anlik_tabela
                 self.tabela_sayaci = 1
+                self.son_tabela = detected_sign
         else:
-            self.son_tabela = "YOK"
-            self.tabela_sayaci = 0
+            self.tabela_sayaci = max(0, self.tabela_sayaci - 1)
+            if self.tabela_sayaci == 0:
+                self.son_tabela = "YOK"
 
         if self.tabela_sayaci >= self.SIGN_CONFIRM_FRAMES:
-            return self.son_tabela
+            return self.son_tabela, sign_box
 
-        return "YOK"
+        return "YOK", sign_box
 
-    # --- 5. KARAR MERKEZİ ---
-    def karar_merkezi(self, isik, tabela, hata):
-        if isik:
-            return "DUR", (0, 0, 255)
+    def decide_direction(self, lane_center, frame_width, tabela="YOK"):
+        frame_center = frame_width // 2
+        raw_error = lane_center - frame_center
 
-        if tabela != "YOK":
-            return tabela, (255, 255, 0)
+        error = int(
+            (1 - self.ERROR_SMOOTH_ALPHA) * self.last_error +
+            self.ERROR_SMOOTH_ALPHA * raw_error
+        )
+        self.last_error = error
 
-        if hata < -self.TURN_ERROR_THRESHOLD:
-            return "SOLA_KIR", (0, 255, 0)
+        if tabela == "SOL":
+            return "SOL", error
+        elif tabela == "SAG":
+            return "SAG", error
 
-        if hata > self.TURN_ERROR_THRESHOLD:
-            return "SAGA_KIR", (0, 255, 0)
+        if error < -self.TURN_ERROR_THRESHOLD:
+            return "SOL", error
+        elif error > self.TURN_ERROR_THRESHOLD:
+            return "SAG", error
+        else:
+            return "DUZ", error
 
-        return "DUZ_GIT", (0, 255, 0)
+    def draw_debug(
+        self,
+        frame,
+        lane_mask,
+        lane_center,
+        left_x,
+        right_x,
+        direction,
+        error,
+        red_box=None,
+        sign_box=None,
+        tabela="YOK"
+    ):
+        h, w = frame.shape[:2]
+        frame_center = w // 2
 
-    # --- 6. ANA DÖNGÜ ---
-    def calistir(self):
+        if left_x is not None:
+            cv2.line(frame, (left_x, h // 2), (left_x, h), (255, 0, 0), 2)
+
+        if right_x is not None:
+            cv2.line(frame, (right_x, h // 2), (right_x, h), (0, 255, 255), 2)
+
+        if lane_center is not None:
+            cv2.line(frame, (lane_center, 0), (lane_center, h), (0, 255, 0), 2)
+
+        cv2.line(frame, (frame_center, 0), (frame_center, h), (0, 0, 255), 2)
+
+        if red_box is not None:
+            x, y, bw, bh = red_box
+            cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 0, 255), 2)
+            cv2.putText(
+                frame, "KIRMIZI", (x, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
+            )
+
+        if sign_box is not None and tabela != "YOK":
+            x, y, bw, bh = sign_box
+            cv2.rectangle(frame, (x, y), (x + bw, y + bh), (255, 0, 0), 2)
+            cv2.putText(
+                frame, f"TABELA: {tabela}", (x, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2
+            )
+
+        cv2.putText(
+            frame, f"Yon: {direction}", (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2
+        )
+        cv2.putText(
+            frame, f"Hata: {error}", (20, 60),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2
+        )
+        cv2.putText(
+            frame, f"Serit Genisligi: {self.last_lane_width}", (20, 90),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2
+        )
+
+        cv2.imshow("Lane Mask", lane_mask)
+        cv2.imshow("Otonom Surus", frame)
+
+    def run(self):
+        cap = cv2.VideoCapture(self.camera_index)
+
+        if not cap.isOpened():
+            print("Kamera acilamadi.")
+            return
+
         while True:
-            ret, kare = self.kamera.read()
+            ret, frame = cap.read()
             if not ret:
-                print("Kameradan kare alinamadi.")
+                print("Frame okunamadi.")
                 break
 
-            hsv = cv2.cvtColor(kare, cv2.COLOR_BGR2HSV)
-            H, W = kare.shape[:2]
+            frame = cv2.resize(frame, (640, 480))
+            h, w = frame.shape[:2]
 
-            isik_var = self.kirmizi_isik_analiz(kare, hsv)
-            tabela_durum = self.tabela_analiz(kare, hsv)
-            hata, lx, rx, yo, roi_x_start, roi_y_start, lane_mask = self.serit_takip(kare, hsv)
-            emir, renk = self.karar_merkezi(isik_var, tabela_durum, hata)
+            # --- Şerit algılama ---
+            roi = frame[h // 2:, :]
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            v_channel = hsv[:, :, 2]
 
-            # Görselleştirme
-            y_cizim = roi_y_start + int((H - roi_y_start) * 0.5)
+            lane_mask = self.adaptive_lane_mask(v_channel)
+            left_x, right_x = self.find_lane_points(lane_mask)
+            lane_center, left_mem, right_mem = self.get_lane_center(left_x, right_x, w)
 
-            if lx is not None and self.lane_memory["left"]["confidence"] >= 2:
-                cv2.circle(kare, (roi_x_start + lx, y_cizim), 10, (255, 0, 0), -1)
+            # --- Kırmızı algılama ---
+            red_detected, red_box = self.detect_red_light(frame)
 
-            if rx is not None and self.lane_memory["right"]["confidence"] >= 2:
-                cv2.circle(kare, (roi_x_start + rx, y_cizim), 10, (0, 0, 255), -1)
+            # --- Tabela algılama ---
+            tabela, sign_box = self.detect_blue_sign(frame)
 
-            cv2.circle(kare, (roi_x_start + yo, y_cizim), 12, (0, 255, 0), -1)
-
-            cv2.putText(kare, f"KOMUT: {emir}", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, renk, 2)
-            cv2.putText(kare, f"HATA: {hata}", (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(kare, f"KIRMIZI: {isik_var}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            cv2.putText(kare, f"TABELA: {tabela_durum}", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
-            cv2.imshow("ANA EKRAN", kare)
+            # --- Karar verme ---
+            if red_detected:
+                direction = "DUR"
+                error = self.last_error
+            else:
+                direction, error = self.decide_direction(lane_center, w, tabela)
 
             if self.DEBUG:
-                cv2.imshow("Serit Maskesi", lane_mask)
+                print(
+                    f"Yon: {direction} | Hata: {error} | "
+                    f"Tabela: {tabela} | Kirmizi: {red_detected}"
+                )
 
-            tus = cv2.waitKey(1) & 0xFF
-            if tus == ord('q'):
-                break
+                self.draw_debug(
+                    frame,
+                    lane_mask,
+                    lane_center,
+                    left_mem,
+                    right_mem,
+                    direction,
+                    error,
+                    red_box,
+                    sign_box,
+                    tabela
+                )
 
-        self.kapat()
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+            else:
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
-    def kapat(self):
-        self.kamera.release()
+        cap.release()
         cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
     sistem = OtonomSurusSistemi(camera_index=0, debug=True)
-    sistem.calistir()
+    sistem.run()
