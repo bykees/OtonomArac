@@ -3,7 +3,7 @@ import numpy as np
 
 
 class OtonomSurusSistemi:
-    def __init__(self, camera_index=0, debug=False):
+    def __init__(self, camera_index=1, debug=False):
         self.camera_index = camera_index
         self.DEBUG = debug
 
@@ -489,5 +489,5 @@ class OtonomSurusSistemi:
 
 
 if __name__ == "__main__":
-    sistem = OtonomSurusSistemi(camera_index=0, debug=True)
+    sistem = OtonomSurusSistemi(camera_index=1, debug=True)
     sistem.run()
